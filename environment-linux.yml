@@ -1,0 +1,13 @@
+name: sim2Beam3D
+channels:
+  - conda-forge
+dependencies:
+# switched from cudatoolkit-dev
+  - cudatoolkit
+  - make
+  - cxx-compiler
+  - fftw
+  - boost-cpp
+  - cmake
+  - libtiff
+  - liblapack
