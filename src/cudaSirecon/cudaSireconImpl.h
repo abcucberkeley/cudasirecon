@@ -38,7 +38,12 @@ using namespace cimg_library;
 
 #define MRC
 #ifdef MRC
-#include <IMInclude.h>  // MRC file I/O routines
+// Use quoted form so this resolves to src/cudaSirecon/IMInclude.h (our
+// local stub with the 4-arg IMWrSec/IMRdSec signatures), not the older
+// src/IVE/linux64/INCLUDE/IMInclude.h which is pulled in for the OTF
+// tools. The otf/ tree keeps using the angle-bracketed IVE headers via
+// its own link path.
+#include "IMInclude.h"  // MRC file I/O routines
 #endif
 
 
@@ -126,6 +131,30 @@ struct ReconParams {
   int   cropYmin, cropYmax;
   int   cropZmin, cropZmax;
   bool  bCropBBox;
+
+  /** Optional chunked reconstruction.
+   *
+   * When any of chunkX/chunkY/chunkZ is positive (and smaller than the
+   * corresponding post-bbox-crop volume dimension), the (possibly
+   * bbox-cropped) raw volume is tiled in X/Y/Z, each tile is run through the
+   * full reconstruction pipeline independently, and the tile outputs are
+   * stitched into a single result on the host. This lets large volumes that
+   * would not fit in VRAM be processed in manageable pieces.
+   *
+   * - chunkX, chunkY are in raw input pixels.
+   * - chunkZ is in *logical* z-planes (the same units as nz), not raw
+   *   interleaved z-sections.
+   * - A value of 0 (or >= axis size) means "use the entire axis" — no tiling
+   *   on that axis.
+   * - chunkOverlap is the tile overlap in input pixels (applied to every
+   *   axis that is being tiled). It must be non-negative and even; half of
+   *   the overlap is trimmed off each interior side of every tile during
+   *   stitching.
+   * - bChunked is true iff at least one axis is actually being tiled.
+   */
+  int   chunkX, chunkY, chunkZ;
+  int   chunkOverlap;
+  bool  bChunked;
   bool  bWriteTitle;   /** whether to write command line args to title field in mrc header */
 
   /* algorithm related parameters */

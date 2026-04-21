@@ -4,6 +4,7 @@
 #include "SIM_reconstructor.hpp"
 #include "cudasireconConfig.h"
 #include <boost/filesystem.hpp>
+#include <algorithm>
 
 #ifdef MRC
 #include "mrc.h"
@@ -82,6 +83,13 @@ void SetDefaultParams(ReconParams *pParams)
   pParams->cropZmin = -1;
   pParams->cropZmax = -1;
   pParams->bCropBBox = false;
+
+  // Chunked reconstruction. 0 on each axis means "don't tile on this axis".
+  pParams->chunkX = 0;
+  pParams->chunkY = 0;
+  pParams->chunkZ = 0;
+  pParams->chunkOverlap = 0;
+  pParams->bChunked = false;
 }
 
 
@@ -108,6 +116,68 @@ unsigned findOptimalDimension(unsigned inSize, int step=-1)
     outSize += step;
 
   return outSize;
+}
+
+
+// A 1D tile description used by the chunked reconstruction path. Coordinates
+// are 0-indexed, inclusive; @c low_edge / @c high_edge mark whether this
+// tile sits on the low/high boundary of the axis and therefore shouldn't be
+// trimmed on that side when stitching.
+struct Tile1D {
+  int lo;
+  int hi;
+  bool low_edge;
+  bool high_edge;
+};
+
+// Split an axis of length @p N into overlapping tiles of size @p c with
+// @p ol pixels of overlap between neighbours.
+//
+// Each tile has a fixed width of @p c (no shorter tiles at the ends), and
+// adjacent tiles advance by @c stride = c - ol. The tile count is the minimum
+// needed for the last tile's right edge to reach @c N-1; that last tile is
+// slid left if necessary so it still fits inside [0, N-1] without overflow.
+//
+// This deviates slightly from the MATLAB reference (cudaSireconChunk.m, which
+// uses @c floor(N/stride) tiles and a variable-size last tile) because the
+// MATLAB formula produces out-of-range intermediate tiles when @c stride is
+// small relative to @c c (e.g. overlap close to the chunk size on a short
+// axis), and the reconstruction pipeline here requires uniform tile widths.
+//
+// When @p c >= N or @p c <= 0, a single tile covers the whole axis.
+// When @p ol >= c, overlap is clamped to @c c-1 to keep stride >= 1.
+static std::vector<Tile1D> tile1D(int N, int c, int ol)
+{
+  std::vector<Tile1D> tiles;
+  if (N <= 0) return tiles;
+
+  if (c <= 0 || c >= N) {
+    tiles.push_back({0, N - 1, true, true});
+    return tiles;
+  }
+  if (ol < 0) ol = 0;
+  if (ol >= c) ol = c - 1;   // keep stride > 0
+
+  const int stride = c - ol;
+  // Minimum number of length-c tiles whose last tile reaches N-1:
+  //   need i*stride + c - 1 >= N - 1  <=>  i >= (N - c) / stride
+  int n = (N - c + stride - 1) / stride + 1;
+  if (n < 1) n = 1;
+
+  for (int i = 0; i < n; ++i) {
+    Tile1D t;
+    t.lo = i * stride;
+    // Slide this tile left if it would overflow past N-1. This keeps every
+    // tile exactly c wide and shrinks the inter-tile stride for the final
+    // pair, which is harmless for the stitching logic (the trim-overlap
+    // accounting operates on half-overlap margins of interior edges only).
+    if (t.lo + c > N) t.lo = N - c;
+    t.hi = t.lo + c - 1;
+    t.low_edge  = (i == 0);
+    t.high_edge = (i == n - 1);
+    tiles.push_back(t);
+  }
+  return tiles;
 }
 
 
@@ -843,6 +913,30 @@ SIM_Reconstructor::SIM_Reconstructor(int argc, char **argv)
   // matching names under the same folder:
   if (boost::filesystem::is_directory(m_myParams.ifiles)) {
     m_all_matching_files = gatherMatchingFiles(m_myParams.ifiles, m_myParams.ofiles);
+
+    // Never treat the OTF file itself as raw input. If the user picked an
+    // output-pattern that happens to match the OTF's filename (e.g. both raw
+    // files and the OTF start with "RAW"), gatherMatchingFiles would otherwise
+    // pull the OTF into m_all_matching_files and setup() would read its tiny
+    // dims as if they were the raw volume.
+    if (!m_myParams.otffiles.empty()) {
+      boost::system::error_code ec;
+      boost::filesystem::path otfPath =
+          boost::filesystem::canonical(m_myParams.otffiles, ec);
+      if (ec) otfPath = boost::filesystem::absolute(m_myParams.otffiles);
+      m_all_matching_files.erase(
+          std::remove_if(
+              m_all_matching_files.begin(), m_all_matching_files.end(),
+              [&](const std::string& f) {
+                boost::system::error_code ec2;
+                boost::filesystem::path p =
+                    boost::filesystem::canonical(f, ec2);
+                if (ec2) p = boost::filesystem::absolute(f);
+                return p == otfPath;
+              }),
+          m_all_matching_files.end());
+    }
+
     m_myParams.bTIFF = (m_all_matching_files.size() > 0);
   }
   if (m_myParams.ifiles.size() >= 4 &&
@@ -870,8 +964,10 @@ SIM_Reconstructor::SIM_Reconstructor(int argc, char **argv)
   if (!m_myParams.bTIFF)
     ::setOutputHeader(m_myParams, m_imgParams, m_out_header);
   #endif
-  //! Load flat-field correction data
-  bgAndSlope(m_myParams, m_imgParams, &m_reconData);
+  //! Load flat-field correction data. In chunked mode this is deferred to
+  //! per-tile allocation inside processOneVolume_chunked().
+  if (!m_myParams.bChunked)
+    bgAndSlope(m_myParams, m_imgParams, &m_reconData);
 }
 
 
@@ -903,7 +999,8 @@ SIM_Reconstructor::SIM_Reconstructor(int nx, int ny,
   std::cout << "zoomz: " << m_myParams.zoomfact << std::endl;
 
   setup(nx, ny, nimages, 1);
-  bgAndSlope(m_myParams, m_imgParams, &m_reconData);
+  if (!m_myParams.bChunked)
+    bgAndSlope(m_myParams, m_imgParams, &m_reconData);
 }
 
 SIM_Reconstructor::~SIM_Reconstructor()
@@ -1008,6 +1105,18 @@ int SIM_Reconstructor::setupProgramOptions()
      "Crop bounding box z min in logical-z units (0-indexed, inclusive, TIFF only)")
     ("cropZmax", po::value<int>(&m_myParams.cropZmax)->default_value(-1),
      "Crop bounding box z max in logical-z units (0-indexed, inclusive, TIFF only)")
+
+    // Chunked reconstruction. Any axis whose chunk size is 0 or >= the
+    // (post-bbox-crop) volume size is not tiled. The bbox crop (if any) is
+    // applied first; tiling happens on the cropped volume.
+    ("chunkX", po::value<int>(&m_myParams.chunkX)->default_value(0),
+     "Chunk size along X in raw input pixels (0 = entire axis)")
+    ("chunkY", po::value<int>(&m_myParams.chunkY)->default_value(0),
+     "Chunk size along Y in raw input pixels (0 = entire axis)")
+    ("chunkZ", po::value<int>(&m_myParams.chunkZ)->default_value(0),
+     "Chunk size along Z in logical z-planes (0 = entire axis)")
+    ("chunkOverlap", po::value<int>(&m_myParams.chunkOverlap)->default_value(0),
+     "Chunk overlap in raw input pixels (must be non-negative and even)")
 
     ("xyres", po::value<float>(&m_imgParams.dxy)->default_value(0.1, "0.1"),
      "x-y pixel size (only used for TIFF files)")
@@ -1138,6 +1247,31 @@ int SIM_Reconstructor::setParams()
     }
   }
 
+  // Chunked reconstruction. Validate the chunk/overlap values and decide
+  // whether chunking is actually enabled. bChunked only becomes true once
+  // setup() has seen the real volume dimensions; here we only sanity-check
+  // and flip it on whenever any chunk axis is positive (it may get flipped
+  // back off in setup() if no axis turns out smaller than its volume dim).
+  if (m_myParams.chunkX < 0 || m_myParams.chunkY < 0 || m_myParams.chunkZ < 0) {
+    throw std::runtime_error("chunkX/chunkY/chunkZ must be >= 0 (0 means entire axis).");
+  }
+  if (m_myParams.chunkOverlap < 0 || (m_myParams.chunkOverlap % 2) != 0) {
+    throw std::runtime_error("chunkOverlap must be non-negative and even.");
+  }
+  if ((m_myParams.chunkX > 0 || m_myParams.chunkY > 0 || m_myParams.chunkZ > 0)) {
+    if (fabs(m_myParams.deskewAngle) > 0.f) {
+      throw std::runtime_error("Chunked reconstruction is incompatible with --deskew.");
+    }
+    m_myParams.bChunked = true;
+    std::cout << "Chunked reconstruction enabled: x="
+              << (m_myParams.chunkX ? std::to_string(m_myParams.chunkX) : "full")
+              << " y="
+              << (m_myParams.chunkY ? std::to_string(m_myParams.chunkY) : "full")
+              << " z="
+              << (m_myParams.chunkZ ? std::to_string(m_myParams.chunkZ) : "full")
+              << " overlap=" << m_myParams.chunkOverlap << std::endl;
+  }
+
   return 0;
 }
 
@@ -1240,6 +1374,47 @@ void SIM_Reconstructor::setup()
   printf("nx_raw=%d, ny=%d, nz=%d\n",
          m_imgParams.nx_raw, m_imgParams.ny, m_imgParams.nz);
 
+  // Now that we know the real (post-bbox-crop) volume dimensions, decide
+  // whether chunking actually kicks in. If every user-requested chunk axis
+  // is already >= its volume dim, there is nothing to tile and we stay on
+  // the single-pass path.
+  if (m_myParams.bChunked) {
+    const int Nx = m_imgParams.nx_raw;
+    const int Ny = m_imgParams.ny;
+    const int Nz = m_imgParams.nz;
+    const bool tileX = (m_myParams.chunkX > 0 && m_myParams.chunkX < Nx);
+    const bool tileY = (m_myParams.chunkY > 0 && m_myParams.chunkY < Ny);
+    const bool tileZ = (m_myParams.chunkZ > 0 && m_myParams.chunkZ < Nz);
+    if (!(tileX || tileY || tileZ)) {
+      std::cout << "Chunk sizes are >= volume dims on every axis; "
+                << "single-pass reconstruction will be used." << std::endl;
+      m_myParams.bChunked = false;
+    } else {
+      std::cout << "Chunked pipeline active on axes:";
+      if (tileX) std::cout << " x(" << m_myParams.chunkX << "/" << Nx << ")";
+      if (tileY) std::cout << " y(" << m_myParams.chunkY << "/" << Ny << ")";
+      if (tileZ) std::cout << " z(" << m_myParams.chunkZ << "/" << Nz << ")";
+      std::cout << " overlap=" << m_myParams.chunkOverlap << std::endl;
+
+      // Warn when the user's single overlap value is >= an axis's chunk
+      // size on an axis that is actually being tiled. That is usually not
+      // what the user wants (the chunk hardly advances between tiles, so we
+      // end up with many near-duplicate reconstructions). We still run,
+      // with overlap internally clamped to chunk-1 per axis.
+      const int ol = m_myParams.chunkOverlap;
+      auto warn = [&](const char* ax, int c) {
+        std::cerr << "Warning: chunkOverlap (" << ol
+                  << ") >= chunk" << ax << " (" << c << "); overlap will be"
+                  << " clamped to " << (c - 1) << " on " << ax
+                  << ". Consider reducing overlap or raising chunk" << ax
+                  << "." << std::endl;
+      };
+      if (tileX && ol >= m_myParams.chunkX) warn("X", m_myParams.chunkX);
+      if (tileY && ol >= m_myParams.chunkY) warn("Y", m_myParams.chunkY);
+      if (tileZ && ol >= m_myParams.chunkZ) warn("Z", m_myParams.chunkZ);
+    }
+  }
+
   setup_common();
 }
 
@@ -1333,7 +1508,12 @@ void SIM_Reconstructor::setup_common()
   ::makematrix(m_myParams.nphases, m_myParams.norders, 0, 0,
       &(m_reconData.sepMatrix[0]), &(m_reconData.noiseVarFactors[0]));
 
-  ::allocateImageBuffers(m_myParams, m_imgParams, &m_reconData);
+  // In chunked mode we skip the volume-sized GPU buffer allocation: every
+  // tile will reallocate its own (smaller) buffers in processOneVolume_chunked().
+  // inscale is recomputed per tile inside that loop too; the assignment here
+  // is still correct for the single-pass fallback.
+  if (!m_myParams.bChunked)
+    ::allocateImageBuffers(m_myParams, m_imgParams, &m_reconData);
 
   m_imgParams.inscale = 1.0 / (m_imgParams.nx * m_imgParams.ny * m_imgParams.nz0 *
       m_myParams.zoomfact * m_myParams.zoomfact * m_myParams.z_zoom * m_myParams.ndirs);
@@ -1366,10 +1546,30 @@ void SIM_Reconstructor::setup_common()
     m_reconData.amp[i][0].x = 1.0f;
     m_reconData.amp[i][0].y = 0.0f;
   }
+
+  // In chunked mode, the host-side stitched-output buffer is sized once the
+  // volume dims are known. It will collect every tile's reconstructed output
+  // and is the source that writeResult() reads from.
+  if (m_myParams.bChunked) {
+    const int Nx_out = (int)(m_myParams.zoomfact * m_imgParams.nx_raw);
+    const int Ny_out = (int)(m_myParams.zoomfact * m_imgParams.ny);
+    const int Nz_out = m_myParams.z_zoom * m_imgParams.nz;
+    m_stitched_output.assign(Nx_out, Ny_out, Nz_out, 1, 0.f);
+  }
 }
 
 
 int SIM_Reconstructor::processOneVolume()
+{
+  if (m_myParams.bChunked) {
+    processOneVolume_chunked();
+    return 1;
+  }
+  processOneVolume_core();
+  return 1;
+}
+
+void SIM_Reconstructor::processOneVolume_core()
 {
   // process one SIM volume (i.e., for the time point timeIdx)
 
@@ -1427,12 +1627,176 @@ int SIM_Reconstructor::processOneVolume()
   }
   clock_t End = clock();//???????
   std::cout<<"time for recon: " << (double)(End - Begin)/ CLOCKS_PER_SEC << "s" << std::endl;
-  return 1;
 }
+
+
+void SIM_Reconstructor::processOneVolume_chunked()
+{
+  // Entire (possibly bbox-cropped) raw volume is currently in rawImage. We
+  // tile it in X/Y/Z, reconstruct each tile in isolation, download the
+  // result, and paste the inner (non-overlap) region into m_stitched_output.
+
+  // Volume-level dims (same values that setup() wrote into m_imgParams).
+  const int Nx = m_imgParams.nx_raw;
+  const int Ny = m_imgParams.ny;
+  const int Nz = m_imgParams.nz;
+  const int ol = m_myParams.chunkOverlap;
+  const int zoom = (int)m_myParams.zoomfact;
+  const int zz   = m_myParams.z_zoom;
+
+  if (m_stitched_output.is_empty()) {
+    // Defensive: setup_common() should have sized this already.
+    m_stitched_output.assign(Nx * zoom, Ny * zoom, Nz * zz, 1, 0.f);
+  }
+  m_stitched_output.fill(0.f);
+
+  // Plan the tiling. An axis whose requested chunk size is 0 or >= its
+  // volume dim becomes a single-tile axis (no trim on either side).
+  const std::vector<Tile1D> xTiles = tile1D(Nx, m_myParams.chunkX, ol);
+  const std::vector<Tile1D> yTiles = tile1D(Ny, m_myParams.chunkY, ol);
+  const std::vector<Tile1D> zTiles = tile1D(Nz, m_myParams.chunkZ, ol);
+
+  const size_t total = xTiles.size() * yTiles.size() * zTiles.size();
+  printf("Chunking: %zu x-tiles x %zu y-tiles x %zu z-tiles = %zu total\n",
+         xTiles.size(), yTiles.size(), zTiles.size(), total);
+
+  // Stash the volume-level state that each tile will temporarily override.
+  CImg<> fullRaw; fullRaw.swap(rawImage);
+  const ImageParams savedImgParams = m_imgParams;
+  const int savedUseTime0k0 = m_myParams.bUseTime0k0;
+  // Each tile is a different spatial region, so never reuse another tile's
+  // k0 fit.
+  m_myParams.bUseTime0k0 = 0;
+
+  const int it = m_imgParams.curTimeIdx;
+  const int iw = 0;
+
+  size_t n = 0;
+  for (const auto& xt : xTiles) {
+    for (const auto& yt : yTiles) {
+      for (const auto& zt : zTiles) {
+        ++n;
+        const int new_nx = xt.hi - xt.lo + 1;
+        const int new_ny = yt.hi - yt.lo + 1;
+        const int new_nz = zt.hi - zt.lo + 1;
+        printf("\n=== Chunk %zu/%zu  x[%d..%d](%d) y[%d..%d](%d) z[%d..%d](%d) ===\n",
+               n, total,
+               xt.lo, xt.hi, new_nx,
+               yt.lo, yt.hi, new_ny,
+               zt.lo, zt.hi, new_nz);
+
+        // Extract the sub-raw (preserving interleaved phase/dir/z layout)
+        // and install it as rawImage so loadImageData() uses it as-is.
+        CImg<float> subRaw = buildSubRaw(fullRaw, xt.lo, yt.lo, zt.lo,
+                                         new_nx, new_ny, new_nz);
+        rawImage.swap(subRaw);
+
+        // Tile-level image-param overrides. Deskew isn't supported in
+        // chunked mode (caught in setParams()), so nx == nx_raw.
+        m_imgParams.nx_raw = new_nx;
+        m_imgParams.nx     = new_nx;
+        m_imgParams.ny     = new_ny;
+        m_imgParams.nz     = new_nz;
+        m_imgParams.nz0    = (m_myParams.nzPadTo ? m_myParams.nzPadTo : new_nz);
+        m_imgParams.inscale =
+            1.0 / (m_imgParams.nx * m_imgParams.ny * m_imgParams.nz0 *
+                   m_myParams.zoomfact * m_myParams.zoomfact *
+                   m_myParams.z_zoom * m_myParams.ndirs);
+
+        // (Re)allocate all buffers whose size depends on the tile dims.
+        ::bgAndSlope(m_myParams, m_imgParams, &m_reconData);
+        ::allocateImageBuffers(m_myParams, m_imgParams, &m_reconData);
+        m_reconData.sum_dir0_phase0.assign(
+            (size_t)m_imgParams.nz * m_imgParams.nwaves, 0.0);
+        for (int d = 0; d < m_myParams.ndirs; ++d) {
+          m_reconData.amp[d][0].x = 1.0f;
+          m_reconData.amp[d][0].y = 0.0f;
+        }
+
+        // Run the per-tile pipeline: upload + bleach correction + recon.
+        loadImageData(it, iw);
+        ::rescaleDriver(it, iw, m_zoffset, &m_myParams, m_imgParams,
+                        &m_driftParams, &m_reconData);
+        processOneVolume_core();
+
+        // Pull this tile's reconstructed output back to the host and paste
+        // its interior (non-overlap) region into the stitched volume.
+        const int tile_nx_out = m_imgParams.nx  * zoom;
+        const int tile_ny_out = m_imgParams.ny  * zoom;
+        const int tile_nz_out = m_imgParams.nz0 * zz;
+
+        CPUBuffer outHost((size_t)tile_nx_out * tile_ny_out * tile_nz_out *
+                          sizeof(float));
+        m_reconData.outbuffer.set(&outHost, 0, outHost.getSize(), 0);
+
+        CImg<float> tileOut((float*)outHost.getPtr(),
+                            tile_nx_out, tile_ny_out, tile_nz_out, 1, true);
+
+        // Per-axis overlap trim. "Don't trim" when the tile abuts the
+        // boundary on that side, OR when the axis has only one tile (no
+        // tiling on that axis at all).
+        auto trim = [&](const Tile1D& t) -> std::pair<int,int> {
+          if (t.low_edge && t.high_edge) return std::make_pair(0, 0);
+          const int lo_trim = t.low_edge  ? 0 : ol / 2;
+          const int hi_trim = t.high_edge ? 0 : ol / 2;
+          return std::make_pair(lo_trim, hi_trim);
+        };
+        const std::pair<int,int> tx = trim(xt);
+        const std::pair<int,int> ty = trim(yt);
+        const std::pair<int,int> tz = trim(zt);
+
+        const int tx_lo_o = tx.first  * zoom, tx_hi_o = tx.second * zoom;
+        const int ty_lo_o = ty.first  * zoom, ty_hi_o = ty.second * zoom;
+        const int tz_lo_o = tz.first  * zz,   tz_hi_o = tz.second * zz;
+
+        const int w_out = tile_nx_out - tx_lo_o - tx_hi_o;
+        const int h_out = tile_ny_out - ty_lo_o - ty_hi_o;
+        const int d_out = tile_nz_out - tz_lo_o - tz_hi_o;
+
+        const int dst_x0 = xt.lo * zoom + tx_lo_o;
+        const int dst_y0 = yt.lo * zoom + ty_lo_o;
+        const int dst_z0 = zt.lo * zz   + tz_lo_o;
+
+        if (w_out > 0 && h_out > 0 && d_out > 0) {
+          for (int z = 0; z < d_out; ++z) {
+            for (int y = 0; y < h_out; ++y) {
+              const float* srow =
+                  tileOut.data(tx_lo_o, y + ty_lo_o, z + tz_lo_o, 0);
+              float* drow =
+                  m_stitched_output.data(dst_x0, y + dst_y0, z + dst_z0, 0);
+              std::memcpy(drow, srow, (size_t)w_out * sizeof(float));
+            }
+          }
+        }
+
+        // Drop the GPU tile output before starting the next tile; the new
+        // tile's processOneVolume_core() will reallocate it at the right
+        // size anyway, but releasing here keeps peak VRAM lower.
+        m_reconData.outbuffer.resize(0);
+        m_reconData.bigbuffer.resize(0);
+
+        // rawImage currently holds this tile's sub-raw; put the tile aside
+        // so the next iteration extracts from the full raw volume again.
+        subRaw.swap(rawImage);
+        // subRaw destructor releases the tile buffer.
+      }
+    }
+  }
+
+  // Restore the full raw volume and volume-level parameters.
+  rawImage.swap(fullRaw);
+  m_imgParams = savedImgParams;
+  m_myParams.bUseTime0k0 = savedUseTime0k0;
+}
+
 
 void SIM_Reconstructor::loadAndRescaleImage(int timeIdx, int waveIdx)
 {
   if (m_myParams.bBessel && m_myParams.bNoRecon) return;
+  // In chunked mode rescaleDriver() runs per tile inside
+  // processOneVolume_chunked(); the volume-level GPU buffer does not exist
+  // here and running this call would operate on stale dimensions.
+  if (m_myParams.bChunked) return;
 
   ::rescaleDriver(timeIdx, waveIdx, m_zoffset, &m_myParams, m_imgParams, 
                   &m_driftParams, &m_reconData);
@@ -1444,45 +1808,37 @@ void SIM_Reconstructor::setRaw(CImg<> &input, int it, int iw)
   loadImageData(it, iw);
 }
 
-void SIM_Reconstructor::cropRawImageToBBox()
+CImg<float> SIM_Reconstructor::buildSubRaw(const CImg<float>& src,
+                                          int xmin, int ymin, int zmin,
+                                          int new_nx, int new_ny,
+                                          int new_nz) const
 {
-  if (!m_myParams.bCropBBox) return;
-
-  const int xmin = m_myParams.cropXmin;
-  const int ymin = m_myParams.cropYmin;
-  const int zmin = m_myParams.cropZmin;
-  const int new_nx = m_myParams.cropXmax - xmin + 1;
-  const int new_ny = m_myParams.cropYmax - ymin + 1;
-  const int new_nz = m_myParams.cropZmax - zmin + 1;
-
   const int nphases = m_myParams.nphases;
   const int ndirs   = m_myParams.ndirs;
-  const int nwaves  = rawImage.spectrum();
+  const int nwaves  = src.spectrum();
 
-  const int orig_nx    = rawImage.width();
-  const int orig_ny    = rawImage.height();
-  const int orig_depth = rawImage.depth();
-  // Per-wave logical z count in the raw TIFF, derived the same way setup() does.
+  const int orig_nx    = src.width();
+  const int orig_ny    = src.height();
+  const int orig_depth = src.depth();
+  // Per-wave logical z count, derived the same way setup() does.
   const int orig_nz    = orig_depth / (nphases * ndirs);
 
-  // Defensive re-check here in case the raw TIFF's dimensions differ from
-  // what setup() saw (e.g. when multiple matching files have different sizes).
-  if (xmin < 0 || m_myParams.cropXmax >= orig_nx ||
-      ymin < 0 || m_myParams.cropYmax >= orig_ny ||
-      zmin < 0 || m_myParams.cropZmax >= orig_nz) {
+  if (xmin < 0 || xmin + new_nx > orig_nx ||
+      ymin < 0 || ymin + new_ny > orig_ny ||
+      zmin < 0 || zmin + new_nz > orig_nz) {
     std::stringstream ss;
-    ss << "Crop bounding box out of range: raw TIFF logical dims ("
+    ss << "Sub-raw extraction out of range: source logical dims ("
        << orig_nx << "," << orig_ny << "," << orig_nz
-       << "); bbox x[" << xmin << ".." << m_myParams.cropXmax
-       << "] y[" << ymin << ".." << m_myParams.cropYmax
-       << "] z[" << zmin << ".." << m_myParams.cropZmax << "]";
+       << "); requested x[" << xmin << ".." << (xmin + new_nx - 1)
+       << "] y[" << ymin << ".." << (ymin + new_ny - 1)
+       << "] z[" << zmin << ".." << (zmin + new_nz - 1) << "]";
     throw std::runtime_error(ss.str());
   }
 
-  // Rebuild the interleaved volume at the cropped size. The per-(dir, phase)
-  // z-slab ordering is the same as what loadImageData() assumes, just with
+  // Rebuild the interleaved volume at the requested sub-size. Per-(dir,
+  // phase) z-slab ordering matches what loadImageData() assumes, just with
   // new_nz instead of orig_nz.
-  CImg<float> cropped(new_nx, new_ny, new_nz * nphases * ndirs, nwaves, 0.f);
+  CImg<float> out(new_nx, new_ny, new_nz * nphases * ndirs, nwaves, 0.f);
 
   for (int w = 0; w < nwaves; ++w) {
     for (int dir_ = 0; dir_ < ndirs; ++dir_) {
@@ -1491,25 +1847,38 @@ void SIM_Reconstructor::cropRawImageToBBox()
         for (int phase_ = 0; phase_ < nphases; ++phase_) {
           int src_zsec, dst_zsec;
           if (m_myParams.bFastSIM) {
-            // File layout: z * ndirs * nphases + dir * nphases + phase
             src_zsec = orig_z * ndirs * nphases + dir_ * nphases + phase_;
             dst_zsec = z_     * ndirs * nphases + dir_ * nphases + phase_;
           } else {
-            // File layout: dir * nz * nphases + z * nphases + phase
             src_zsec = dir_ * orig_nz * nphases + orig_z * nphases + phase_;
             dst_zsec = dir_ * new_nz  * nphases + z_     * nphases + phase_;
           }
           for (int y = 0; y < new_ny; ++y) {
-            const float* src = rawImage.data(xmin, y + ymin, src_zsec, w);
-            float*       dst = cropped .data(0,    y,        dst_zsec, w);
-            std::memcpy(dst, src, new_nx * sizeof(float));
+            const float* sp = src.data(xmin, y + ymin, src_zsec, w);
+            float*       dp = out.data(0,    y,        dst_zsec, w);
+            std::memcpy(dp, sp, new_nx * sizeof(float));
           }
         }
       }
     }
   }
 
-  rawImage.assign(cropped);
+  return out;
+}
+
+void SIM_Reconstructor::cropRawImageToBBox()
+{
+  if (!m_myParams.bCropBBox) return;
+
+  const int new_nx = m_myParams.cropXmax - m_myParams.cropXmin + 1;
+  const int new_ny = m_myParams.cropYmax - m_myParams.cropYmin + 1;
+  const int new_nz = m_myParams.cropZmax - m_myParams.cropZmin + 1;
+
+  rawImage = buildSubRaw(rawImage,
+                         m_myParams.cropXmin,
+                         m_myParams.cropYmin,
+                         m_myParams.cropZmin,
+                         new_nx, new_ny, new_nz);
 }
 
 void SIM_Reconstructor::setFile(int it, int iw)
@@ -1537,7 +1906,10 @@ void SIM_Reconstructor::setFile(int it, int iw)
     rawImage.assign(rawImage_t);
   }
   #endif
-  loadImageData(it, iw);
+  // In chunked mode we defer the GPU upload: each tile will run its own
+  // loadImageData() on a sub-CImg carved out of the (bbox-cropped) rawImage.
+  if (!m_myParams.bChunked)
+    loadImageData(it, iw);
 }
 
 void SIM_Reconstructor::loadImageData(int it, int iw) {
@@ -1826,8 +2198,66 @@ void SIM_Reconstructor::getResult(float * result) {
   memcpy(result, outCimg.data(), outCimg.size() * sizeof(float));
 }
 
+void SIM_Reconstructor::writeStitchedResult(int it, int iw)
+{
+  if (m_stitched_output.is_empty()) {
+    throw std::runtime_error(
+        "writeStitchedResult() called but m_stitched_output is empty.");
+  }
+
+  if (m_myParams.bTIFF) {
+    std::string outPath =
+        makeOutputFilePath(m_all_matching_files[it], std::string("_proc"));
+    if (m_myParams.bOutputUint16) {
+      CImg<unsigned short> out16(m_stitched_output.width(),
+                                 m_stitched_output.height(),
+                                 m_stitched_output.depth());
+      cimg_forXYZ(m_stitched_output, x, y, z) {
+        float v = m_stitched_output(x, y, z);
+        if (v < 0.f) v = 0.f;
+        else if (v > 65535.f) v = 65535.f;
+        out16(x, y, z) = static_cast<unsigned short>(v + 0.5f);
+      }
+      out16.save_tiff(outPath.c_str(), 1);
+    } else {
+      m_stitched_output.save_tiff(outPath.c_str(), 1);
+    }
+  }
+#ifdef MRC
+  else {
+    const int nx_out = m_stitched_output.width();
+    const int ny_out = m_stitched_output.height();
+    const int nz_out = m_stitched_output.depth();
+    float maxval = -FLT_MAX;
+    float minval =  FLT_MAX;
+    for (int z = 0; z < nz_out; ++z) {
+      float* slice = m_stitched_output.data(0, 0, z);
+      IMWrSec(ostream_no, slice, nx_out * ny_out, m_out_header.mode);
+      if (it == 0) {
+        const size_t n = (size_t)nx_out * ny_out;
+        for (size_t i = 0; i < n; ++i) {
+          if (slice[i] > maxval) maxval = slice[i];
+          if (slice[i] < minval) minval = slice[i];
+        }
+      }
+    }
+    if (it == 0 && iw == 0) {
+      m_out_header.amin = minval;
+      m_out_header.amax = maxval;
+    }
+  }
+#endif
+  printf("Time point %d, wave %d done (chunked)\n", it, iw);
+}
+
+
 void SIM_Reconstructor::writeResult(int it, int iw)
 {
+  if (m_myParams.bChunked) {
+    writeStitchedResult(it, iw);
+    return;
+  }
+
   CPUBuffer outbufferHost(
       (m_myParams.zoomfact * m_imgParams.nx) *
       (m_myParams.zoomfact * m_imgParams.ny) *

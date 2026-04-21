@@ -45,12 +45,28 @@ std::vector<std::string> gatherMatchingFiles(std::string target_path, std::strin
   sort(all_matching_files.begin(), all_matching_files.end());
 
 
-  // Create output subfolder "decon/" just under the data folder:
+  // Create output subfolder "GPUsirecon/" just under the data folder.
+  // Default permissions are 0775 (rwxrwxr-x) so group members (e.g. shared
+  // analysis accounts on cluster filesystems) can read and write into it;
+  // the process umask would otherwise typically strip group-write.
   outputDir = target_path;
   outputDir /= "GPUsirecon";
 
-  if (! boost::filesystem::exists(outputDir) )
+  if (! boost::filesystem::exists(outputDir) ) {
     boost::filesystem::create_directory(outputDir);
+    boost::system::error_code ec;
+    boost::filesystem::permissions(
+        outputDir,
+        boost::filesystem::owner_all |
+        boost::filesystem::group_all |
+        boost::filesystem::others_read |
+        boost::filesystem::others_exe,
+        ec);
+    if (ec) {
+      std::cerr << "Warning: could not set 0775 permissions on "
+                << outputDir.string() << ": " << ec.message() << std::endl;
+    }
+  }
 
   return all_matching_files;
 }

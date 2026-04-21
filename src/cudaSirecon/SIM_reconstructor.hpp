@@ -97,6 +97,10 @@ public:
 
 private:
   CImg<> rawImage;
+  //! Set by processOneVolume() when running in chunked mode. Holds the full
+  //! stitched output volume on the host. writeResult() emits from this when
+  //! non-empty (spectrum() > 0). Always at zoomed output dimensions.
+  CImg<float> m_stitched_output;
   std::string m_config_file;
   ReconParams m_myParams;
   ImageParams m_imgParams;
@@ -167,6 +171,40 @@ private:
     wavelength channels).
    */
   void cropRawImageToBBox();
+
+  //! Build a sub-volume CImg from a source interleaved (phase/dir/z) CImg.
+  /*!
+    Copies the region [xmin, xmin+new_nx) x [ymin, ymin+new_ny) x
+    [zmin, zmin+new_nz) of logical z-planes out of @p src into a new CImg,
+    preserving the per-(dir, phase) section interleaving (both fastSIM and
+    non-fastSIM layouts). Used by cropRawImageToBBox() and by the chunked
+    reconstruction path.
+   */
+  CImg<float> buildSubRaw(const CImg<float>& src,
+                          int xmin, int ymin, int zmin,
+                          int new_nx, int new_ny, int new_nz) const;
+
+  //! Chunked reconstruction driver.
+  /*!
+    Tiles the (already-possibly-bbox-cropped) @c rawImage in X/Y/Z according
+    to m_myParams.chunk{X,Y,Z}/chunkOverlap, runs the full reconstruction on
+    each tile independently, and writes the stitched result into
+    @c m_stitched_output. Called from processOneVolume() when
+    m_myParams.bChunked is true.
+   */
+  void processOneVolume_chunked();
+
+  //! Reconstruction body (shared between chunked and non-chunked paths).
+  /*!
+    Identical to the old body of processOneVolume(): FFT-based band
+    separation, k0/modamp fitting, Wiener filtering, real-space band
+    assembly. Assumes loadImageData() and rescaleDriver() have already run
+    for the current raw tile/volume.
+   */
+  void processOneVolume_core();
+
+  //! Emit @c m_stitched_output from the chunked path to disk.
+  void writeStitchedResult(int it, int iw);
 };
 
 #endif
