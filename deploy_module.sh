@@ -5,8 +5,21 @@ SRC=/global/home/users/matthewmueller/miniconda3/envs/sim2Beam3D
 DST=/global/home/groups/software/rocky-8.x86_64/modules/cudasirecon/2Beam3D
 PATCHELF=/global/home/groups/software/rocky-8.x86_64/modules/patchelf/0.17.2/bin/patchelf
 
-echo "=== Syncing bin/, lib/, include/ ==="
-rsync -aP "$SRC/bin" "$SRC/lib" "$SRC/include" "$DST/"
+# Only the project's own binaries go into the module's bin/. The conda env
+# drops in dozens of unrelated tools (tclsh, python helpers, etc.) that we
+# don't want to ship as part of the cudasirecon module.
+BIN_WHITELIST=(cudasirecon makeotf otfviewer)
+
+echo "=== Syncing bin/ (whitelist), lib/, include/ ==="
+mkdir -p "$DST/bin"
+for b in "${BIN_WHITELIST[@]}"; do
+  if [[ -f "$SRC/bin/$b" ]]; then
+    rsync -aP "$SRC/bin/$b" "$DST/bin/"
+  else
+    echo "  warning: $SRC/bin/$b not found, skipping" >&2
+  fi
+done
+rsync -aP "$SRC/lib" "$SRC/include" "$DST/"
 
 echo ""
 echo "=== Patching RPATH ==="
