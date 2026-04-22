@@ -386,5 +386,12 @@ extern "C" void sgels_(const char*, int*, int*, int*, float*, int*, float*,
 //extern "C" int save_tiff(TIFF *tif, const unsigned int directory, int colind, const int nwaves, int width, int height, float * buffer , int bIsComplex);
 std::vector<std::string> gatherMatchingFiles(std::string target_path, std::string pattern);
 std::string makeOutputFilePath(std::string inputFileName, std::string insert);
+// Explicitly set (and create) the output folder, overriding the default
+// "<input-folder>/GPUsirecon" behavior of gatherMatchingFiles. The caller is
+// expected to have already resolved relative paths against the input folder;
+// this function will use `path` as-is. Safe to call before or instead of
+// gatherMatchingFiles; gatherMatchingFiles will skip its own default mkdir
+// when an override has been set.
+void setOutputFolder(const std::string& path);
 
 #endif

@@ -907,6 +907,27 @@ SIM_Reconstructor::SIM_Reconstructor(int argc, char **argv)
 
   printf("nphases=%d, ndirs=%d\n", m_myParams.nphases, m_myParams.ndirs);
 
+  // If the user provided --output-folder, honor it for both folder-of-tiffs
+  // mode and single-tiff-file mode. Relative paths are resolved against the
+  // input folder (so a bare name like "my_out" becomes
+  // "<input-folder>/my_out/"); absolute paths are used as-is. Doing this
+  // BEFORE gatherMatchingFiles() is what suppresses the default
+  // "<input>/GPUsirecon" subfolder creation.
+  if (m_varsmap.count("output-folder")) {
+    const std::string& od = m_varsmap["output-folder"].as<std::string>();
+    if (!od.empty()) {
+      boost::filesystem::path out(od);
+      if (out.is_relative()) {
+        boost::filesystem::path base(m_myParams.ifiles);
+        // In single-TIFF-file mode, the "input folder" is the file's parent.
+        if (!boost::filesystem::is_directory(base))
+          base = base.parent_path();
+        out = base / out;
+      }
+      setOutputFolder(out.string());
+    }
+  }
+
   // In TIFF mode, m_myParams.ifiles refers to the name of the folder raw data resides in;
   // and m_myParams.ofiles refers to a pattern in all the raw data file names.
   // To help decide if input is in TIFF or MRC format, gather all TIFF files with
@@ -1015,6 +1036,12 @@ int SIM_Reconstructor::setupProgramOptions()
   m_progopts.add_options()
     ("input-file", po::value<std::string>(), "input file name (or data folder in TIFF mode)")
     ("output-file", po::value<std::string>(), "output file name (or filename pattern in TIFF mode)")
+    ("output-folder", po::value<std::string>()->default_value(""),
+     "output folder for reconstructed TIFF files. If a bare folder name or "
+     "relative path is given, it is created as a subfolder of the input "
+     "folder (<input-folder>/<output-folder>); if an absolute path is given, "
+     "it is used as-is. If empty (default), TIFF outputs are written to "
+     "\"<input-folder>/GPUsirecon/\".")
     ("otf-file", po::value<std::string>()->required(), "OTF file name")
     ("config,c", po::value<std::string>(&m_config_file)->default_value(""),
      "name of a config file with parameters in place of command-line options")

@@ -5,6 +5,50 @@
 #include <algorithm> // sort
 
 static boost::filesystem::path outputDir;
+// Tracks whether the caller explicitly set the output folder (via
+// setOutputFolder). When true, gatherMatchingFiles() will NOT override it
+// with the default "<input-folder>/GPUsirecon" subfolder.
+static bool outputDirOverridden = false;
+
+static void createOutputDirIfNeeded(const boost::filesystem::path& dir)
+{
+  namespace bfs = boost::filesystem;
+  if (dir.empty() || bfs::exists(dir)) return;
+
+  boost::system::error_code ec;
+  bfs::create_directories(dir, ec);
+  if (ec) {
+    std::cerr << "Warning: could not create output dir "
+              << dir.string() << ": " << ec.message() << std::endl;
+    return;
+  }
+  // Default permissions 0775 so group members (shared analysis accounts on
+  // cluster filesystems) can read and write into it; the process umask would
+  // otherwise typically strip group-write.
+  bfs::permissions(
+      dir,
+      bfs::owner_all |
+      bfs::group_all |
+      bfs::others_read |
+      bfs::others_exe,
+      ec);
+  if (ec) {
+    std::cerr << "Warning: could not set 0775 permissions on "
+              << dir.string() << ": " << ec.message() << std::endl;
+  }
+}
+
+void setOutputFolder(const std::string& path)
+{
+  if (path.empty()) {
+    outputDirOverridden = false;
+    outputDir.clear();
+    return;
+  }
+  outputDir = boost::filesystem::path(path);
+  outputDirOverridden = true;
+  createOutputDirIfNeeded(outputDir);
+}
 
 std::vector<std::string> gatherMatchingFiles(std::string target_path, std::string pattern)
 {
@@ -45,27 +89,12 @@ std::vector<std::string> gatherMatchingFiles(std::string target_path, std::strin
   sort(all_matching_files.begin(), all_matching_files.end());
 
 
-  // Create output subfolder "GPUsirecon/" just under the data folder.
-  // Default permissions are 0775 (rwxrwxr-x) so group members (e.g. shared
-  // analysis accounts on cluster filesystems) can read and write into it;
-  // the process umask would otherwise typically strip group-write.
-  outputDir = target_path;
-  outputDir /= "GPUsirecon";
-
-  if (! boost::filesystem::exists(outputDir) ) {
-    boost::filesystem::create_directory(outputDir);
-    boost::system::error_code ec;
-    boost::filesystem::permissions(
-        outputDir,
-        boost::filesystem::owner_all |
-        boost::filesystem::group_all |
-        boost::filesystem::others_read |
-        boost::filesystem::others_exe,
-        ec);
-    if (ec) {
-      std::cerr << "Warning: could not set 0775 permissions on "
-                << outputDir.string() << ": " << ec.message() << std::endl;
-    }
+  // If the caller hasn't overridden the output directory (via setOutputDir),
+  // fall back to the historical default of "<input-folder>/GPUsirecon/".
+  if (!outputDirOverridden) {
+    outputDir = target_path;
+    outputDir /= "GPUsirecon";
+    createOutputDirIfNeeded(outputDir);
   }
 
   return all_matching_files;
